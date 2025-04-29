@@ -1,5 +1,5 @@
 // fma16_testgen.c
-// David_Harris 8 February 2025
+// Noah Fotenos 18 February 2025
 // Generate tests for 16-bit FMA
 // SPDX-License-Identifier: Apache-2.0 WITH SHL-2.1
 
@@ -17,6 +17,10 @@ typedef union sp {
 // lists of tests, terminated with 0x8000
 uint16_t easyExponents[] = {15, 0x8000};
 uint16_t easyFracts[] = {0, 0x200, 0x8000}; // 1.0 and 1.1
+uint16_t medExponents[] = {1, 15, 20, 30, 0x8000}; //from -14 to 15 with bias
+uint16_t medFracts[] = {1, 0x3A0, 0x3FF, 0x8000}; // 1.0 and all 1's in fract
+uint16_t specExponents[] = {0, 20, 31, 0x8000}; //edgecases
+uint16_t specFracts[] = {0, 0x342, 0x3FF, 0x8000}; // edgecases
 
 void softfloatInit(void) {
     softfloat_roundingMode = softfloat_round_minMag; 
@@ -77,7 +81,7 @@ void genCase(FILE *fptr, float16_t x, float16_t y, float16_t z, int mul, int add
     float16_t resultmag = result;
     resultmag.v &= 0x7FFF; // take absolute value
     if (f16_lt(resultmag, smallest) && (resultmag.v != 0x0000)) fprintf (fptr, "// skip denorm: ");
-    if ((softfloat_exceptionFlags >> 1) % 2) fprintf(fptr, "// skip underflow: ");
+    if ((softfloat_exceptionFlags) >> 1 % 2) fprintf(fptr, "// skip underflow: ");
 
     // skip special cases if requested
     if (resultmag.v == 0x0000 && !zeroAllowed) fprintf(fptr, "// skip zero: ");
@@ -129,19 +133,90 @@ void genMulTests(uint16_t *e, uint16_t *f, int sgn, char *testName, char *desc, 
     fclose(fptr);
 }
 
+void genAddTests(uint16_t *e, uint16_t *f, int sgn, char *testName, char *desc, int roundingMode, int zeroAllowed, int infAllowed, int nanAllowed) {
+    int i, j, k, numCases;
+    float16_t x, y, z;
+    float16_t cases[100000];
+    FILE *fptr;
+    char fn[80];
+ 
+    sprintf(fn, "work/%s.tv", testName);
+    if ((fptr = fopen(fn, "w")) == 0) {
+        printf("Error opening to write file %s.  Does directory exist?\n", fn);
+        exit(1);
+    }
+    prepTests(e, f, testName, desc, cases, fptr, &numCases);
+    y.v = 0x3C00;
+    for (i=0; i < numCases; i++) { 
+        z.v = cases[i].v;
+        for (j=0; j<numCases; j++) {
+            x.v = cases[j].v;
+            for (k=0; k<=sgn; k++) {
+                x.v ^= (k<<15);
+                genCase(fptr, x, y, z, 0, 1, 0, 0, roundingMode, zeroAllowed, infAllowed, nanAllowed);
+            }
+        }
+    }
+    fclose(fptr);
+}
+
+void genMulAddTests(uint16_t *e, uint16_t *f, int sgn, char *testName, char *desc, int roundingMode, int zeroAllowed, int infAllowed, int nanAllowed) {
+    int i, j, k, l, numCases;
+    float16_t x, y, z;
+    float16_t cases[100000];
+    FILE *fptr;
+    char fn[80];
+ 
+    sprintf(fn, "work/%s.tv", testName);
+    if ((fptr = fopen(fn, "w")) == 0) {
+        printf("Error opening to write file %s.  Does directory exist?\n", fn);
+        exit(1);
+    }
+    prepTests(e, f, testName, desc, cases, fptr, &numCases);
+    for (i=0; i < numCases; i++) { 
+        x.v = cases[i].v;
+        for (j=0; j<numCases; j++) {
+            y.v = cases[j].v;
+            for (l=0;l<numCases;l++) {
+                z.v = cases[l].v;
+                for (k=0; k<=sgn; k++) {
+                    x.v ^= (k<<15);
+                    genCase(fptr, x, y, z, 1, 1, 0, 0, roundingMode, zeroAllowed, infAllowed, nanAllowed);
+                }
+            }
+        }
+    }
+    fclose(fptr);
+}
+
 int main()
 {
     if (system("mkdir -p work") != 0) exit(1); // create work directory if it doesn't exist
     softfloatInit(); // configure softfloat modes
  
     // Test cases: multiplication
-    genMulTests(easyExponents, easyFracts, 0, "fmul_0", "// Multiply with exponent of 0, significand of 1.0 and 1.1, RZ", 0, 0, 0, 0);
-
+   //genMulTests(easyExponents, easyFracts, 0, "fmul_0", "// Multiply with exponent of 0, significand of 1.0 and 1.1, RZ", 0, 0, 0, 0);
+    
 /*  // example of how to generate tests with a different rounding mode
     softfloat_roundingMode = softfloat_round_near_even; 
     genMulTests(easyExponents, easyFracts, 0, "fmul_0_rne", "// Multiply with exponent of 0, significand of 1.0 and 1.1, RNE", 1, 0, 0, 0); */
 
     // Add your cases here
-  
+    genMulTests(medExponents, medFracts, 0, "fmul_1", "// Multiply with any but non extreme exponent , all fractions", 0, 0, 0, 0);
+    genMulTests(medExponents, medFracts, 1, "fmul_2", "// Multiply with any but non extreme exponent , all fractions and allow negative", 0, 0, 0, 0);
+    genAddTests(easyExponents, easyFracts, 0, "fadd_0", "// add with exponent of 0, significand of 1.0 and 1.1, RZ", 0, 0, 0, 0);
+    genAddTests(medExponents, medFracts, 0, "fadd_1", "// add with any but non extreme exponent , all fractions and all positive", 0, 0, 0, 0);
+    genAddTests(medExponents, medFracts, 1, "fadd_2", "// add with any but non extreme exponent , all fractions and allow negative", 0, 0, 0, 0);
+    genMulAddTests(easyExponents, easyFracts, 0, "fma_0", "// nultiply and add with exponent of 0, significand of 1.0 and 1.1, RZ", 0, 0, 0, 0);
+    genMulAddTests(medExponents, medFracts, 0, "fma_1", "// multiply and add with any but non extreme exponent , all fractions and all positive", 0, 0, 0, 0);
+    genMulAddTests(medExponents, medFracts, 1, "fma_2", "// multiply and add with any but non extreme exponent , all fractions and allow negative", 0, 0, 0, 0);
+    genMulAddTests(specExponents, specFracts, 1, "fma_special_rz", "// multiply and add with edge cases, RZ", 0, 1, 1, 1);
+    softfloat_roundingMode = softfloat_round_near_even;  //set rounding modes
+    genMulAddTests(specExponents, specFracts, 1, "fma_special_rne", "// multiply and add with edge cases, RNE", 1, 0, 0, 0);
+    softfloat_roundingMode = softfloat_round_min; 
+    genMulAddTests(specExponents, specFracts, 1, "fma_special_rn", "// muultiply and add with edge cases, RN", 2, 0, 0, 0);
+    softfloat_roundingMode = softfloat_round_max; 
+    genMulAddTests(specExponents, specFracts, 1, "fma_special_rp", "// multiply and add with edge cases, RP", 3, 0, 0, 0);
+    
     return 0;
 }
