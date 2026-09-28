@@ -3,11 +3,16 @@
 //
 // Purpose: Standalone self-checking unit test for src/vpu/vfrec7.sv.
 //
-// This does not compare against another copy of the RTL. Expected values
-// come from an independent real-number decode of IEEE 754 bit patterns
-// (rechecking the RISC-V vfrec7 accuracy bound, |approx*x - 1| <= 2^-6)
-// and from the standard IEEE round-on-overflow table, both derived from
-// the spec rather than from the design under test.
+// This does not reuse any of the DUT's RTL.
+// Expected values are computed bit-exact by an independent reference model
+// (function expected_vfrec7 below) that reimplements the ISA-level
+// algorithm directly from IEEE 754 bit fields: normalize, look up the
+// 7-bit reciprocal approximation, recompute the output exponent, and
+// reassemble, including the reciprocal-result-is-subnormal case. The 7-bit
+// approximation is computed from its definition (function rec7_ref), not
+// copied from the RVV table, so a wrong table entry in the RTL is caught.
+// Directed special cases (NaN/Inf/zero/overflow) use the standard IEEE
+// tables the same way.
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 `include "config.vh"
@@ -31,10 +36,6 @@ module tb_vfrec7;
   localparam int NV = 4;
   localparam int DZ = 3;
   localparam int OF = 2;
-
-  // Generous relative-error bound: the spec guarantees 2^-7, this leaves
-  // margin so the test only catches real regressions, not ulp nitpicks.
-  localparam real ERR_BOUND = 2.0 ** -6;
 
   logic [63:0] vs2;
   logic [2:0]  vsew;
@@ -100,6 +101,7 @@ module tb_vfrec7;
 
   int checks = 0;
   int errors = 0;
+  int logfd;   // results/vfrec7.log: one line per check, pass or fail
 
   // ----------------------------------------------------------------------
   // Bit-pattern <-> real helpers, independent of the DUT
@@ -117,25 +119,71 @@ module tb_vfrec7;
               (fracval & fracmask);
   endfunction
 
-  function automatic real decode_fp(
-    input logic [63:0] bits, input int expbits, input int fracbits
+  // ----------------------------------------------------------------------
+  // Golden reference model for finite, nonzero, non-overflow inputs.
+  // Reimplements the ISA-level vfrec7 algorithm directly from the IEEE 754
+  // bit fields (normalize -> 7-bit LUT -> recompute exponent -> reassemble,
+  // including the case where the reciprocal result is itself subnormal),
+  // independent of the DUT's RTL.
+  // ----------------------------------------------------------------------
+
+  // Reference 7-bit reciprocal: the reciprocal of the midpoint of input
+  // interval idx, [1 + idx/128, 1 + (idx+1)/128), scaled into [1,2) and its
+  // 7 fraction bits rounded to nearest. This reproduces the RVV vfrec7
+  // table without copying its values; no entry is within 0.02 ulp of a tie,
+  // so real arithmetic is exact enough.
+  function automatic logic [6:0] rec7_ref(input longint unsigned idx);
+    real m;
+    m = 1.0 + real'(2*idx + 1) / 256.0;
+    return 7'($rtoi((2.0/m - 1.0) * 128.0 + 0.5));
+  endfunction
+
+  function automatic int clz(input longint unsigned val, input int width);
+    clz = width;
+    for (int i = width-1; i >= 0; i--)
+      if (val[i]) begin
+        clz = width-1-i;
+        break;
+      end
+  endfunction
+
+  function automatic void expected_vfrec7(
+    input  logic            sign,
+    input  longint unsigned expfield,
+    input  longint unsigned fracfield,   // must be nonzero when expfield == 0
+    input  int               expbits,
+    input  int               fracbits,
+    output logic [63:0]      exp_vd,
+    output logic [4:0]       exp_fflags
   );
-    logic sign;
-    longint unsigned expfield, fracfield, expmask, fracmask;
-    int bias;
-    real fracval, val;
-    expmask  = (64'h1 << expbits)  - 1;
-    fracmask = (64'h1 << fracbits) - 1;
-    sign     = bits[expbits+fracbits];
-    expfield = (bits >> fracbits) & expmask;
-    fracfield = bits & fracmask;
-    bias = (1 << (expbits-1)) - 1;
-    if (expfield == 0)
-      fracval = real'(fracfield) / real'(longint'(1) << fracbits);
-    else
-      fracval = 1.0 + real'(fracfield) / real'(longint'(1) << fracbits);
-    val = fracval * (2.0 ** real'((expfield == 0 ? 1 : longint'(expfield)) - bias));
-    decode_fp = sign ? -val : val;
+    longint unsigned bias, idx, shifted, r7, frac_out, pre_shift;
+    longint signed   e, eOutBiased;
+    int              z;
+
+    bias       = (64'h1 << (expbits-1)) - 1;
+    exp_fflags = 5'b0;
+
+    if (expfield != 0) begin // normal input: already in [1,2)
+      e   = longint'(expfield) - longint'(bias);
+      idx = fracfield >> (fracbits-7);
+    end else begin // subnormal input: shift the implicit leading 1 into place
+      z       = clz(fracfield, fracbits);
+      e       = -longint'(bias) - longint'(z);
+      shifted = (fracfield << (z+1)) & ((64'h1 << fracbits) - 1);
+      idx     = shifted >> (fracbits-7);
+    end
+
+    r7         = rec7_ref(idx);
+    eOutBiased = longint'(bias) - 1 - e; // this format's biased output exponent
+
+    if (eOutBiased == 0 || eOutBiased == -1) begin // reciprocal result is itself subnormal
+      pre_shift = (64'h1 << fracbits) | (r7 << (fracbits-7));
+      frac_out  = (pre_shift >> (eOutBiased == 0 ? 1 : 2)) & ((64'h1 << fracbits) - 1);
+      exp_vd    = pack_fp(sign, 64'h0, frac_out, expbits, fracbits);
+    end else begin // normal result
+      frac_out = r7 << (fracbits-7);
+      exp_vd   = pack_fp(sign, eOutBiased, frac_out, expbits, fracbits); // eOutBiased >= 1 here
+    end
   endfunction
 
   function automatic int expbits_of(input logic [2:0] sew);
@@ -153,44 +201,30 @@ module tb_vfrec7;
   task automatic check_exact(
     input string tag, input logic [63:0] exp_vd, input logic [4:0] exp_fflags
   );
+    logic pass;
     #1;
     checks++;
-    if (vd !== exp_vd || fflags !== exp_fflags) begin
+    pass = (vd === exp_vd) && (fflags === exp_fflags);
+    if (!pass) begin
       errors++;
       $display("MISMATCH[%s]: vsew=%0d rm=%0d vs2=%h  got(vd=%h,fflags=%b)  want(vd=%h,fflags=%b)",
                 tag, vsew, rm, vs2, vd, fflags, exp_vd, exp_fflags);
     end
-  endtask
-
-  task automatic check_approx(input string tag, input int expbits, input int fracbits);
-    real x, y, err;
-    #1;
-    checks++;
-    if (fflags !== 5'b0) begin
-      errors++;
-      $display("MISMATCH[%s]: vsew=%0d vs2=%h expected no flags, got fflags=%b",
-                tag, vsew, vs2, fflags);
-      return;
-    end
-    x = decode_fp(vs2, expbits, fracbits);
-    y = decode_fp(vd,  expbits, fracbits);
-    err = (x * y) - 1.0;
-    if (err < 0.0) err = -err;
-    if (err > ERR_BOUND) begin
-      errors++;
-      $display("MISMATCH[%s]: vsew=%0d vs2=%h vd=%h  x=%f y=%f |x*y-1|=%f > %f",
-                tag, vsew, vs2, vd, x, y, err, ERR_BOUND);
-    end
+    $fdisplay(logfd, "%s [%s] vsew=%0d rm=%0d vs2=%h -> vd=%h fflags=%b (want vd=%h fflags=%b)",
+              pass ? "PASS" : "FAIL", tag, vsew, rm, vs2, vd, fflags, exp_vd, exp_fflags);
   endtask
 
   task automatic check_top7_match(
     input string tag, input logic [6:0] a, input logic [6:0] b
   );
+    logic pass;
     checks++;
-    if (a !== b) begin
+    pass = (a === b);
+    if (!pass) begin
       errors++;
       $display("MISMATCH[%s]: top-7 significand differs across SEW: %h vs %h", tag, a, b);
     end
+    $fdisplay(logfd, "%s [%s] a=%h b=%h", pass ? "PASS" : "FAIL", tag, a, b);
   endtask
 
   // ----------------------------------------------------------------------
@@ -212,6 +246,8 @@ module tb_vfrec7;
   logic [63:0] sign_mask, pos_inf, max_finite, canonical_nan;
 
   initial begin
+    logfd = $fopen("results/vfrec7.log", "w");
+
     fw[0] = 10; eb[0] = 5;  sews[0] = VSEW_16;
     fw[1] = 23; eb[1] = 8;  sews[1] = VSEW_32;
     fw[2] = 52; eb[2] = 11; sews[2] = VSEW_64;
@@ -270,7 +306,7 @@ module tb_vfrec7;
     end
 
     // ======================================================================
-    // Generic finite, nonzero, non-overflow inputs: accuracy-bound sweep
+    // Generic finite, nonzero, non-overflow inputs: exact-match sweep
     // ======================================================================
     for (int fmt = 0; fmt < 3; fmt++) begin
       int unsigned width, expbits;
@@ -289,8 +325,11 @@ module tb_vfrec7;
             lowbits  = lowfill ? ((64'h1 << lowwidth) - 1) : 64'h0;
             frac     = (longint'(idx) << lowwidth) | lowbits;
             for (int sgn = 0; sgn < 2; sgn++) begin
+              logic [63:0] exp_vd;
+              logic [4:0]  exp_fflags;
+              expected_vfrec7(sgn[0], expval, frac, expbits, width, exp_vd, exp_fflags);
               vs2 = pack_fp(sgn[0], expval, frac, expbits, width);
-              check_approx("normal-sweep", expbits, width);
+              check_exact("normal-sweep", exp_vd, exp_fflags);
             end
           end
         end
@@ -302,8 +341,11 @@ module tb_vfrec7;
           longint unsigned frac;
           frac = (64'h1 << (width-1-k)) | (longint'(idx) >> (k+1));
           for (int sgn = 0; sgn < 2; sgn++) begin
+            logic [63:0] exp_vd;
+            logic [4:0]  exp_fflags;
+            expected_vfrec7(sgn[0], 64'h0, frac, expbits, width, exp_vd, exp_fflags);
             vs2 = pack_fp(sgn[0], 64'h0, frac, expbits, width);
-            check_approx("subnormal-sweep", expbits, width);
+            check_exact("subnormal-sweep", exp_vd, exp_fflags);
           end
         end
       end
@@ -343,6 +385,12 @@ module tb_vfrec7;
       $display("ALL PASS: %0d checks, 0 mismatches", checks);
     else
       $display("FAILURES: %0d/%0d checks mismatched", errors, checks);
+
+    if (errors == 0)
+      $fdisplay(logfd, "ALL PASS: %0d checks, 0 mismatches", checks);
+    else
+      $fdisplay(logfd, "FAILURES: %0d/%0d checks mismatched", errors, checks);
+    $fclose(logfd);
 
     $finish(errors == 0 ? 0 : 1);
   end
