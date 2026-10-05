@@ -53,6 +53,8 @@ module tb_vfrecrsqrt7;
   // unpackinput expects a scalar-style FLEN-wide operand that is properly
   // NaN-boxed above its native width. Vector elements carry no such
   // boxing, so the selected SEW-wide element is boxed here first.
+  // Invalid SEWs are unpacked as half precision so the DUT sees real
+  // input classes and must suppress the result and flags on its own.
   // ----------------------------------------------------------------------
   logic [P.FMTBITS-1:0] fmt;
   logic [P.FLEN-1:0]    boxedVs2;
@@ -62,7 +64,7 @@ module tb_vfrecrsqrt7;
       VSEW_16: begin fmt = P.H_FMT; boxedVs2 = {{(P.FLEN-16){1'b1}}, vs2[15:0]}; end
       VSEW_32: begin fmt = P.S_FMT; boxedVs2 = {{(P.FLEN-32){1'b1}}, vs2[31:0]}; end
       VSEW_64: begin fmt = P.D_FMT; boxedVs2 = vs2;                             end
-      default: begin fmt = P.H_FMT; boxedVs2 = '0;                              end
+      default: begin fmt = P.H_FMT; boxedVs2 = {{(P.FLEN-16){1'b1}}, vs2[15:0]}; end
     endcase
 
   logic            sign, nan, snan, zero, inf, subnorm;
@@ -539,6 +541,27 @@ module tb_vfrecrsqrt7;
             check_top7_match("cross-sew16v32", top7[0], top7[1]);
             check_top7_match("cross-sew32v64", top7[1], top7[2]);
           end
+        end
+      end
+    end
+
+    // ======================================================================
+    // Invalid SEW (8-bit is reserved for these ops, 1xx is reserved): the
+    // result and fflags must be all zero. The inputs are half-precision
+    // values that would otherwise give a nonzero result or raise a flag.
+    // ======================================================================
+    for (int op = 0; op < 2; op++) begin
+      isSqrt = op[0];
+      for (int sv = 0; sv < 8; sv++) begin
+        if (sv == VSEW_16 || sv == VSEW_32 || sv == VSEW_64) continue;
+        vsew = sv[2:0];
+        for (int rmv = 0; rmv < 8; rmv += 3) begin  // RNE, RUP, RMM-and-up
+          rm = rmv[2:0];
+          vs2 = 64'h3c00; check_exact("invalid-sew", 64'h0, 5'b0);  // 1.0
+          vs2 = 64'h0000; check_exact("invalid-sew", 64'h0, 5'b0);  // +0 (DZ)
+          vs2 = 64'h7c01; check_exact("invalid-sew", 64'h0, 5'b0);  // sNaN (NV)
+          vs2 = 64'h0001; check_exact("invalid-sew", 64'h0, 5'b0);  // tiny subnormal (rec7 OF, NX)
+          vs2 = 64'hbc00; check_exact("invalid-sew", 64'h0, 5'b0);  // -1.0 (rsqrt7 NV)
         end
       end
     end
